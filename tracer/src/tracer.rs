@@ -3,33 +3,26 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#![expect(static_mut_refs)]
-
-use std::cell::OnceCell;
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use std::{fs, io, thread};
 
 use log::warn;
 use serde::Serialize;
 
 #[derive(Debug)]
 struct Tracer {
-    events: Arc<Mutex<HashMap<String, Vec<TraceEvent>>>>,
-    thread_depths: HashMap<String, Arc<AtomicU64>>,
+    events: HashMap<String, Vec<TraceEvent>>,
     start: Instant,
 }
 
 impl Tracer {
     fn new() -> Self {
         Self {
-            events: Arc::new(Mutex::new(HashMap::default())),
+            events: HashMap::default(),
             start: Instant::now(),
-            thread_depths: HashMap::default(),
         }
     }
 
@@ -37,70 +30,35 @@ impl Tracer {
         let end = Instant::now();
         // SAFETY: FFI call
         let path = format!("cloud-hypervisor-{}.trace", unsafe { libc::getpid() });
-        let mut file = File::create(&path).unwrap();
 
         #[derive(Serialize)]
-        struct TraceReport {
+        struct TraceReport<'a> {
             duration: Duration,
-            events: Arc<Mutex<HashMap<String, Vec<TraceEvent>>>>,
+            events: &'a HashMap<String, Vec<TraceEvent>>,
         }
 
         let trace_report = TraceReport {
             duration: end.duration_since(self.start),
-            events: Arc::clone(&self.events),
+            events: &self.events,
         };
 
-        serde_json::to_writer_pretty(&file, &trace_report).unwrap();
+        let result = serde_json::to_vec_pretty(&trace_report)
+            .map_err(io::Error::from)
+            .and_then(|trace| fs::write(&path, trace));
 
-        file.flush().unwrap();
-
-        warn!("Trace output: {path}");
-    }
-
-    fn add_event(&mut self, event: TraceEvent) {
-        let current = thread::current();
-        let thread_name = current.name().unwrap_or("");
-        let mut events = self.events.lock().unwrap();
-        if let Some(thread_events) = events.get_mut(thread_name) {
-            thread_events.push(event);
-        } else {
-            events.insert(thread_name.to_string(), vec![event]);
+        match result {
+            Ok(()) => warn!("Trace output: {path}"),
+            Err(e) => warn!("Failed to write trace output {path}: {e}"),
         }
-    }
-
-    fn increase_thread_depth(&mut self) {
-        let current = thread::current();
-        let thread_name = current.name().unwrap_or("");
-        if let Some(depth) = self.thread_depths.get_mut(thread_name) {
-            depth.fetch_add(1, Ordering::SeqCst);
-        } else {
-            self.thread_depths
-                .insert(thread_name.to_string(), Arc::new(AtomicU64::new(0)));
-        }
-    }
-
-    #[expect(clippy::panic, reason = "unbalanced tracing calls")]
-    fn decrease_thread_depth(&mut self) {
-        let current = thread::current();
-        let thread_name = current.name().unwrap_or("");
-        if let Some(depth) = self.thread_depths.get_mut(thread_name) {
-            depth.fetch_sub(1, Ordering::SeqCst);
-        } else {
-            panic!("Unmatched decrease for thread: {thread_name}");
-        }
-    }
-
-    fn thread_depth(&self) -> u64 {
-        let current = thread::current();
-        let thread_name = current.name().unwrap_or("");
-        self.thread_depths
-            .get(thread_name)
-            .map(|v| v.load(Ordering::SeqCst))
-            .unwrap_or_default()
     }
 }
 
-static mut TRACER: OnceCell<Tracer> = OnceCell::new();
+// Events outside start() and end() are dropped.
+static TRACER: Mutex<Option<Tracer>> = Mutex::new(None);
+
+thread_local! {
+    static THREAD_DEPTH: Cell<u64> = const { Cell::new(0) };
+}
 
 #[derive(Clone, Debug, Serialize)]
 struct TraceEvent {
@@ -110,19 +68,30 @@ struct TraceEvent {
     depth: u64,
 }
 
-pub fn trace_point_log(event: &'static str) {
-    let trace_event = TraceEvent {
-        // SAFETY: start has been initialised as part of initialising the value of TRACER
-        timestamp: Instant::now().duration_since(unsafe { TRACER.get().unwrap().start }),
-        event,
-        end_timestamp: None,
-        // SAFETY: thread_depth accesses current thread only specific data
-        depth: unsafe { TRACER.get().unwrap().thread_depth() },
+fn add_event(event: &'static str, start: Instant, end: Option<Instant>) {
+    let depth = THREAD_DEPTH.get();
+    let mut tracer = TRACER.lock().unwrap();
+    let Some(tracer) = tracer.as_mut() else {
+        return;
     };
-    // SAFETY: add_event accesses current thread only specific data
-    unsafe {
-        TRACER.get_mut().unwrap().add_event(trace_event);
-    }
+
+    let trace_event = TraceEvent {
+        timestamp: start.duration_since(tracer.start),
+        event,
+        end_timestamp: end.map(|end| end.duration_since(tracer.start)),
+        depth,
+    };
+
+    let thread_name = thread::current().name().unwrap_or("").to_string();
+    tracer
+        .events
+        .entry(thread_name)
+        .or_default()
+        .push(trace_event);
+}
+
+pub fn trace_point_log(event: &'static str) {
+    add_event(event, Instant::now(), None);
 }
 
 pub struct TraceBlock {
@@ -132,10 +101,7 @@ pub struct TraceBlock {
 
 impl TraceBlock {
     pub fn new(event: &'static str) -> Self {
-        // SAFETY: increase_thread_depth accesses current thread only specific data
-        unsafe {
-            TRACER.get_mut().unwrap().increase_thread_depth();
-        }
+        THREAD_DEPTH.set(THREAD_DEPTH.get() + 1);
         Self {
             start: Instant::now(),
             event,
@@ -145,20 +111,9 @@ impl TraceBlock {
 
 impl Drop for TraceBlock {
     fn drop(&mut self) {
-        // SAFETY: start has been initialised as part of initialising the value of TRACER
-        let start = unsafe { TRACER.get().unwrap().start };
-        let trace_event = TraceEvent {
-            timestamp: self.start.duration_since(start),
-            event: self.event,
-            end_timestamp: Some(Instant::now().duration_since(start)),
-            // SAFETY: thread_depth() returns a number local to the current thread
-            depth: unsafe { TRACER.get().unwrap().thread_depth() },
-        };
-        // SAFETY: add_event and decrease_thread_depth access current thread only specific data
-        unsafe {
-            TRACER.get_mut().unwrap().add_event(trace_event);
-            TRACER.get_mut().unwrap().decrease_thread_depth();
-        }
+        let end = Instant::now();
+        THREAD_DEPTH.set(THREAD_DEPTH.get() - 1);
+        add_event(self.event, self.start, Some(end));
     }
 }
 
@@ -177,11 +132,63 @@ macro_rules! trace_scoped {
 }
 
 pub fn end() {
-    // SAFETY: this is called after all other threads end
-    unsafe { TRACER.get().unwrap().end() }
+    let tracer = TRACER.lock().unwrap().take();
+    if let Some(tracer) = tracer {
+        tracer.end();
+    }
 }
 
 pub fn start() {
-    // SAFETY: this is called before other threads start
-    unsafe { TRACER.set(Tracer::new()).unwrap() }
+    *TRACER.lock().unwrap() = Some(Tracer::new());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trace_events() {
+        // Neither an event outside a trace nor a second start() may panic.
+        trace_point!("before_start");
+
+        start();
+        start();
+
+        {
+            trace_scoped!("outer");
+
+            {
+                trace_scoped!("inner");
+            }
+
+            trace_point!("point");
+        }
+
+        thread::Builder::new()
+            .name("other".to_string())
+            .spawn(|| {
+                trace_scoped!("other");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        // Take the trace instead of calling end() so that no file is written.
+        let tracer = TRACER.lock().unwrap().take().unwrap();
+        trace_point!("after_end");
+
+        let depths = |thread_name: &str| -> Vec<(&'static str, u64)> {
+            tracer.events[thread_name]
+                .iter()
+                .map(|e| (e.event, e.depth))
+                .collect()
+        };
+
+        let thread_name = thread::current().name().unwrap_or("").to_string();
+        assert_eq!(
+            depths(thread_name.as_str()),
+            [("inner", 1), ("point", 1), ("outer", 0)]
+        );
+        assert_eq!(depths("other"), [("other", 0)]);
+    }
 }
