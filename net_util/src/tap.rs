@@ -476,6 +476,7 @@ impl Tap {
     }
 
     // Both tun and macvtap answer EINVAL for a queue already in the requested state.
+    #[cfg(not(fuzzing))]
     fn set_queue(&self, flag: c_short) -> Result<()> {
         let mut ifreq = self.get_ifreq();
         ifreq.ifr_ifru.ifru_flags = flag;
@@ -486,6 +487,12 @@ impl Tap {
             Err(Error::IoctlError(_, e)) if e.raw_os_error() == Some(libc::EINVAL) => Ok(()),
             result => result,
         }
+    }
+
+    // The net fuzzer backs a Tap with a socketpair, which rejects TUNSETQUEUE.
+    #[cfg(fuzzing)]
+    fn set_queue(&self, _flag: c_short) -> Result<()> {
+        Ok(())
     }
 
     /// Set the size of the vnet hdr.
